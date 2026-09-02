@@ -1355,8 +1355,9 @@ def _handle_create(args: dict, **kw) -> str:
     assignee = args.get("assignee")
     if not assignee:
         return tool_error(
-            "assignee is required — name the profile that should execute this "
-            "task (the dispatcher will only spawn tasks with an assignee)"
+            "assignee is required — name the local profile or remote "
+            "peer:<peer>/<profile> target that should execute this task "
+            "(the dispatcher will only spawn tasks with an assignee)"
         )
     body = args.get("body")
     parents = args.get("parents") or []
@@ -2149,8 +2150,9 @@ KANBAN_CREATE_SCHEMA = {
             "assignee": {
                 "type": "string",
                 "description": (
-                    "Profile name that should execute this task "
-                    "(e.g. 'researcher-a', 'reviewer', 'writer'). "
+                    "Local profile or remote peer target that should execute "
+                    "this task (e.g. 'researcher-a', 'writer', or "
+                    "'peer:spark/researcher'). "
                     "Required — tasks without an assignee are never "
                     "dispatched."
                 ),

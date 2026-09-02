@@ -215,6 +215,30 @@ hermes kanban stats
 
 When the dispatcher picks up `t_abcd` and spawns the `researcher` profile, the very first thing that worker's model does is call `kanban_show()` to read its task. It doesn't run `hermes kanban show t_abcd`.
 
+### Remote peer executor (first slice)
+
+An assignee can also target a named profile on a registered Hermes peer:
+
+```bash
+hermes peer add spark --url http://spark.lan:8377 --key <API_SERVER_KEY>
+hermes kanban create "research the remote host" \
+  --assignee peer:spark/researcher
+```
+
+The dispatcher keeps its normal local worker path unchanged. For a
+`peer:<peer>/<profile>` target it launches a small local bridge process, which
+uses the existing peer Bearer authentication and the peer's profile-multiplexed
+session/chat API. Each attempt gets an isolated remote session and carries a
+versioned `hermes.kanban.remote-exec.v1` task envelope. The remote profile's
+final response becomes the originating task's result; a stale run cannot commit
+because completion is guarded by the local run id. Transport failures follow
+the existing crash/retry and failure-limit behavior.
+
+This first slice is result-oriented: remote filesystem changes and local
+attachment paths are not synchronized back. Use it for work whose durable
+handoff is the response (research, analysis, remote operations), or arrange a
+shared repository/storage channel separately.
+
 ### Gateway-embedded dispatcher (default)
 
 The dispatcher runs inside the gateway process. Nothing to install, no

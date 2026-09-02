@@ -35,6 +35,7 @@ import urllib.parse
 import urllib.request
 
 BOT_CHAT_TITLE = "Bot Chat"
+KANBAN_PROTOCOL = "hermes.kanban.remote-exec.v1"
 _PEER_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 _PROFILE_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$")
 
@@ -145,6 +146,102 @@ def _parse_target(target: str) -> tuple[str, str | None]:
     if profile and not _PROFILE_RE.match(profile):
         raise ValueError(f"Invalid agent/profile name: {profile!r}")
     return peer, profile
+
+
+def parse_kanban_target(target: str) -> tuple[str, str]:
+    """Parse ``peer:<peer>/<profile>`` used by the Kanban dispatcher.
+
+    Remote Kanban execution deliberately requires an explicit profile.  A
+    bare peer DM has a useful launch-profile meaning, but an executor target
+    must remain stable when the remote gateway's launch profile changes.
+    """
+    raw = (target or "").strip()
+    if not raw.startswith("peer:"):
+        raise ValueError("Remote Kanban target must start with 'peer:'")
+    peer, profile = _parse_target(raw[len("peer:"):])
+    if not _PEER_NAME_RE.match(peer):
+        raise ValueError(f"Invalid peer name: {peer!r}")
+    if not profile:
+        raise ValueError(
+            "Remote Kanban target requires a profile: peer:<peer>/<profile>"
+        )
+    return peer, profile
+
+
+def execute_kanban_task(
+    target: str,
+    *,
+    task_id: str,
+    context: str,
+    timeout: int = DM_TIMEOUT_S,
+) -> dict:
+    """Run one isolated Kanban turn on a registered peer.
+
+    Transport and authentication are intentionally the same as ``peer dm``:
+    the registered ``bot_peers`` URL, profile multiplex path, and the peer's
+    ``API_SERVER_KEY`` Bearer credential.  The small versioned envelope is
+    carried as the session-chat message, so compatible existing gateways need
+    no new unaudited server surface.
+    """
+    peer_name, profile = parse_kanban_target(target)
+    peer = _load_peers().get(peer_name)
+    if not isinstance(peer, dict) or not peer.get("url"):
+        raise RuntimeError(f"No peer named '{peer_name}'")
+    key = _peer_secret(peer_name)
+    if not key:
+        raise RuntimeError(
+            f"No API key for peer '{peer_name}' ({_peer_key_env(peer_name)})"
+        )
+
+    base = _base_url(peer, profile)
+    created = _request(
+        f"{base}/api/sessions",
+        key,
+        method="POST",
+        # No stable title/id: every attempt is isolated, including retries.
+        # Reusing ``Kanban <task>`` would hit the API's unique-title guard.
+        body={"source": "kanban"},
+    )
+    session = (
+        created.get("session")
+        if isinstance(created.get("session"), dict)
+        else created
+    )
+    session_id = str(session.get("id") or session.get("session_id") or "")
+    if not session_id:
+        raise RuntimeError("Peer did not return a session id for Kanban execution")
+
+    envelope = {
+        "protocol": KANBAN_PROTOCOL,
+        "action": "execute_task",
+        "task": {"id": task_id, "context": context},
+        "contract": {
+            "mode": "single_turn",
+            "result": "Return a concise completion summary as your final response.",
+            "lifecycle": (
+                "Do not call kanban lifecycle tools; the caller records the result."
+            ),
+        },
+    }
+    result = _request(
+        f"{base}/api/sessions/{urllib.parse.quote(session_id, safe='')}/chat",
+        key,
+        method="POST",
+        body={"message": json.dumps(envelope, ensure_ascii=False)},
+        timeout=timeout,
+    )
+    message = result.get("message")
+    summary = str(message.get("content") or "").strip() if isinstance(message, dict) else ""
+    if not summary:
+        raise RuntimeError("Peer returned an empty Kanban result")
+    return {
+        "protocol": KANBAN_PROTOCOL,
+        "status": "completed",
+        "peer": peer_name,
+        "profile": profile,
+        "session_id": result.get("session_id") or session_id,
+        "summary": summary,
+    }
 
 
 def _http_error_detail(exc: urllib.error.HTTPError) -> str:

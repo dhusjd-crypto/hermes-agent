@@ -31,6 +31,16 @@ def test_parse_target_rejects_bad_profile():
         peer_cmd._parse_target("spark/../etc")
 
 
+def test_parse_kanban_target_requires_peer_prefix_and_profile():
+    assert peer_cmd.parse_kanban_target("peer:spark/researcher") == (
+        "spark", "researcher"
+    )
+    with pytest.raises(ValueError):
+        peer_cmd.parse_kanban_target("spark/researcher")
+    with pytest.raises(ValueError):
+        peer_cmd.parse_kanban_target("peer:spark")
+
+
 # ── url scoping ──────────────────────────────────────────────────────────────
 
 
@@ -114,13 +124,13 @@ class _FakePeer(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length", 0))
         body = json.loads(self.rfile.read(length) or b"{}")
 
-        if self.path == "/api/sessions":
+        if self.path.endswith("/api/sessions"):
             type(self).sessions.append("bc_1")
             # REAL api_server create shape: the row is wrapped under "session"
             # (verified live Aug 2026 — a flat fake hid a parser bug).
             return self._json({"object": "hermes.session", "session": {"id": "bc_1", "title": body.get("title")}}, 201)
 
-        if self.path.startswith("/api/sessions/") and self.path.endswith("/chat"):
+        if "/api/sessions/" in self.path and self.path.endswith("/chat"):
             type(self).chats.append(body.get("message"))
             return self._json(
                 {
@@ -186,3 +196,31 @@ def test_dm_reuses_existing_bot_chat(monkeypatch, capsys, fake_peer_server):
     assert payload["reply"] == "reply from the other machine"
     # No new session was created — the existing canonical chat was reused.
     assert _FakePeer.sessions == ["bc_existing"]
+
+
+def test_execute_kanban_uses_profile_mirror_bearer_and_versioned_envelope(
+    monkeypatch, fake_peer_server,
+):
+    monkeypatch.setattr(
+        peer_cmd, "_load_peers",
+        lambda: {"spark": {"url": fake_peer_server}},
+    )
+    monkeypatch.setattr(
+        peer_cmd, "_peer_secret", lambda name: "secret-key-123456"
+    )
+
+    result = peer_cmd.execute_kanban_task(
+        "peer:spark/researcher",
+        task_id="t_remote1",
+        context="# Task\nDo the remote work.",
+    )
+
+    assert result["status"] == "completed"
+    assert result["profile"] == "researcher"
+    assert result["summary"] == "reply from the other machine"
+    envelope = json.loads(_FakePeer.chats[-1])
+    assert envelope["protocol"] == peer_cmd.KANBAN_PROTOCOL
+    assert envelope["task"] == {
+        "id": "t_remote1", "context": "# Task\nDo the remote work."
+    }
+    assert all(a == "Bearer secret-key-123456" for a in _FakePeer.auth_seen)

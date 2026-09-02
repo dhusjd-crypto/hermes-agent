@@ -10068,7 +10068,11 @@ def _dispatch_once_locked(
             # assume spawnable, matching the review loop's own fallback.
             return any(row["assignee"] for row in review_rows)
         return any(
-            row["assignee"] and _rpe(row["assignee"]) for row in review_rows
+            row["assignee"] and (
+                _is_remote_executor_target(row["assignee"])
+                or _rpe(row["assignee"])
+            )
+            for row in review_rows
         )
 
     ready_budget = spawn_budget
@@ -10103,7 +10107,10 @@ def _dispatch_once_locked(
     if _default_assignee:
         try:
             from hermes_cli.profiles import profile_exists as _pe
-            _default_assignee_resolved = bool(_pe(_default_assignee))
+            _default_assignee_resolved = (
+                _is_remote_executor_target(_default_assignee)
+                or bool(_pe(_default_assignee))
+            )
         except Exception:
             # Profiles module not importable (test stubs, exotic envs).
             # Trust the operator's config and try the assignment; the
@@ -10172,7 +10179,11 @@ def _dispatch_once_locked(
             from hermes_cli.profiles import profile_exists  # local import: avoids cycle
         except Exception:
             profile_exists = None  # type: ignore[assignment]
-        if profile_exists is not None and not profile_exists(row_assignee):
+        if (
+            profile_exists is not None
+            and not _is_remote_executor_target(row_assignee)
+            and not profile_exists(row_assignee)
+        ):
             # Bucket separately from skipped_unassigned: the operator
             # cannot fix this by assigning a profile (the assignee IS the
             # intended owner — a terminal lane). Health telemetry uses
@@ -10326,7 +10337,11 @@ def _dispatch_once_locked(
             from hermes_cli.profiles import profile_exists
         except Exception:
             profile_exists = None  # type: ignore[assignment]
-        if profile_exists is not None and not profile_exists(row["assignee"]):
+        if (
+            profile_exists is not None
+            and not _is_remote_executor_target(row["assignee"])
+            and not profile_exists(row["assignee"])
+        ):
             result.skipped_nonspawnable.append(row["id"])
             continue
         if _per_profile_cap is not None:
@@ -10706,6 +10721,80 @@ def _retag_legacy_worker_sessions(workspaces_root_path: str) -> None:
         _log.debug("kanban worker: legacy session retag skipped (%s)", exc)
 
 
+def _is_remote_executor_target(assignee: Optional[str]) -> bool:
+    """Whether an assignee is a valid ``peer:<peer>/<profile>`` target."""
+    try:
+        from hermes_cli.subcommands.peer import parse_kanban_target
+
+        parse_kanban_target(assignee or "")
+        return True
+    except (ImportError, ValueError):
+        return False
+
+
+def _default_remote_spawn(
+    task: Task,
+    workspace: str,
+    *,
+    board: Optional[str] = None,
+) -> Optional[int]:
+    """Spawn a child bridge for one remote HTTP execution.
+
+    The child owns the potentially long network wait, preserving the local
+    dispatcher's fire-and-forget behavior and short dispatch-lock hold time.
+    """
+    import subprocess
+    import sys
+
+    if not task.assignee or not _is_remote_executor_target(task.assignee):
+        raise ValueError(f"task {task.id} has an invalid remote assignee")
+
+    env = dict(os.environ)
+    from gateway.session_context import _VAR_MAP
+    for key in _VAR_MAP:
+        env.pop(key, None)
+    if task.tenant:
+        env["HERMES_TENANT"] = task.tenant
+    env["HERMES_KANBAN_TASK"] = task.id
+    env["HERMES_KANBAN_REMOTE_TARGET"] = task.assignee
+    env["HERMES_KANBAN_WORKSPACE"] = workspace
+    env["HERMES_SESSION_SOURCE"] = "kanban"
+    if task.current_run_id is not None:
+        env["HERMES_KANBAN_RUN_ID"] = str(task.current_run_id)
+    if task.claim_lock:
+        env["HERMES_KANBAN_CLAIM_LOCK"] = task.claim_lock
+    env["HERMES_KANBAN_DB"] = str(kanban_db_path(board=board))
+    env["HERMES_KANBAN_WORKSPACES_ROOT"] = str(workspaces_root(board=board))
+    env["HERMES_KANBAN_BOARD"] = (
+        _normalize_board_slug(board) or get_current_board()
+    )
+
+    log_dir = worker_logs_dir(board=board)
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_path = log_dir / f"{task.id}.log"
+    rotate_bytes, backup_count = worker_log_rotation_config()
+    _rotate_worker_log(log_path, rotate_bytes, backup_count)
+    log_f = open(log_path, "ab")
+    try:
+        proc = subprocess.Popen(  # noqa: S603 -- fixed interpreter/module argv
+            [sys.executable, "-m", "hermes_cli.kanban_remote_worker"],
+            # The bridge never operates on the local task workspace. Keeping
+            # the dispatcher's cwd also makes ``python -m`` work in source
+            # checkouts that are not installed editable.
+            cwd=None,
+            stdin=subprocess.DEVNULL,
+            stdout=log_f,
+            stderr=subprocess.STDOUT,
+            env=env,
+            start_new_session=True,
+            creationflags=subprocess.CREATE_NO_WINDOW if _IS_WINDOWS else 0,
+        )
+    except Exception:
+        log_f.close()
+        raise
+    return proc.pid
+
+
 def _default_spawn(
     task: Task,
     workspace: str,
@@ -10727,6 +10816,8 @@ def _default_spawn(
     import subprocess
     if not task.assignee:
         raise ValueError(f"task {task.id} has no assignee")
+    if _is_remote_executor_target(task.assignee):
+        return _default_remote_spawn(task, workspace, board=board)
 
     from hermes_cli.profiles import normalize_profile_name
 
