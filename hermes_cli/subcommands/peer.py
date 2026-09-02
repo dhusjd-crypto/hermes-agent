@@ -42,7 +42,10 @@ _PROFILE_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$")
 # One synchronous agent turn can legitimately take minutes.
 DM_TIMEOUT_S = 600
 LIST_TIMEOUT_S = 30
-KANBAN_PROBE_TIMEOUT_S = 2
+# A recovering profile can need the same cold-start window as the sessions
+# lookup used by ``peer dm``.  Keeping this shorter made a reachable peer look
+# offline forever when every profile-scoped request took more than two seconds.
+KANBAN_PROBE_TIMEOUT_S = LIST_TIMEOUT_S
 
 
 class PeerUnavailableError(RuntimeError):

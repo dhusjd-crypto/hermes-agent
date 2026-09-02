@@ -318,6 +318,30 @@ def test_dispatch_keeps_exhausted_remote_task_blocked_while_peer_is_offline(
     assert current.status == "blocked"
 
 
+def test_recovery_probe_uses_normal_peer_request_window(monkeypatch):
+    """A cold-started profile must not be failed by a two-second probe."""
+    seen = {}
+    monkeypatch.setattr(
+        peer_cmd,
+        "_load_peers",
+        lambda: {"spark": {"url": "http://spark.example"}},
+    )
+    monkeypatch.setattr(peer_cmd, "_peer_secret", lambda _name: "secret")
+
+    def fake_request(url, key, *, timeout):
+        seen.update(url=url, key=key, timeout=timeout)
+        return {"data": []}
+
+    monkeypatch.setattr(peer_cmd, "_request", fake_request)
+
+    assert peer_cmd.probe_kanban_target("peer:spark/researcher")
+    assert seen == {
+        "url": "http://spark.example/p/researcher/api/sessions?limit=1",
+        "key": "secret",
+        "timeout": peer_cmd.LIST_TIMEOUT_S,
+    }
+
+
 def test_dispatch_does_not_revive_ordinary_remote_failure(
     tmp_path, monkeypatch,
 ):
