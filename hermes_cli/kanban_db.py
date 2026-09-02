@@ -338,6 +338,7 @@ def _fire_dispatch_tick_hook(
             result.stale,
             result.timed_out,
             result.auto_blocked,
+            result.peer_recovered,
             result.rate_limited,
             result.auto_assigned_default,
             result.respawn_guarded,
@@ -8082,6 +8083,8 @@ class DispatchResult:
     spawned. ``None`` when memory was fine/unknown and the guard imposed
     no restriction. Reclaim/promotion bookkeeping still ran either way;
     deferred tasks stay queued for the next tick."""
+    peer_recovered: list[str] = field(default_factory=list)
+    """Remote tasks revived after their previously-offline peer recovered."""
 
 
 # Bounded registry of recently-reaped worker child exits, populated by the
@@ -9343,6 +9346,113 @@ def _record_spawn_failure(
     )
 
 
+def record_remote_peer_unavailable(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    error: str,
+    expected_run_id: int,
+) -> bool:
+    """Mark an active remote attempt as a transport-level peer outage.
+
+    Retry accounting remains owned by the normal worker-crash path. This
+    run-scoped marker is deliberately separate from ``last_failure_error`` so
+    the later crash classification cannot erase the evidence needed for safe
+    automatic recovery.
+    """
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT assignee FROM tasks WHERE id = ? AND status = 'running' "
+            "AND current_run_id = ?",
+            (task_id, int(expected_run_id)),
+        ).fetchone()
+        if row is None or not _is_remote_executor_target(row["assignee"]):
+            return False
+        _append_event(
+            conn,
+            task_id,
+            "remote_peer_unavailable",
+            {"target": row["assignee"], "error": error[:500]},
+            run_id=int(expected_run_id),
+        )
+    return True
+
+
+def _remote_recovery_candidates(conn: sqlite3.Connection) -> dict[str, list[str]]:
+    """Return blocked peer-outage tasks grouped by remote target.
+
+    A candidate must have exhausted into ``gave_up`` and its latest run must
+    carry the explicit transport marker. Manual/worker blocks and ordinary
+    remote execution failures therefore remain sticky.
+    """
+    rows = conn.execute(
+        "SELECT t.id, t.assignee FROM tasks t "
+        "JOIN task_runs r ON r.id = ("
+        "  SELECT MAX(r2.id) FROM task_runs r2 WHERE r2.task_id = t.id"
+        ") "
+        "WHERE t.status = 'blocked' AND t.assignee LIKE 'peer:%' "
+        "AND r.outcome = 'crashed' "
+        "AND EXISTS (SELECT 1 FROM task_events marker "
+        "            WHERE marker.task_id = t.id AND marker.run_id = r.id "
+        "              AND marker.kind = 'remote_peer_unavailable') "
+        "AND (SELECT kind FROM task_events latest "
+        "     WHERE latest.task_id = t.id "
+        "       AND latest.kind IN ('gave_up', 'blocked', 'unblocked', "
+        "                           'promoted', 'status') "
+        "     ORDER BY latest.id DESC LIMIT 1) = 'gave_up'"
+    ).fetchall()
+    grouped: dict[str, list[str]] = {}
+    for row in rows:
+        target = row["assignee"] or ""
+        if _is_remote_executor_target(target):
+            grouped.setdefault(target, []).append(row["id"])
+    return grouped
+
+
+def _probe_remote_recovery_targets(conn: sqlite3.Connection) -> set[str]:
+    """Probe candidate peers outside the dispatch lock, once per target."""
+    candidates = _remote_recovery_candidates(conn)
+    if not candidates:
+        return set()
+    try:
+        from hermes_cli.subcommands.peer import probe_kanban_target
+    except ImportError:
+        return set()
+    return {target for target in candidates if probe_kanban_target(target)}
+
+
+def _recover_remote_peer_tasks(
+    conn: sqlite3.Connection, reachable_targets: set[str],
+) -> list[str]:
+    """Revive still-eligible tasks after a successful out-of-lock probe."""
+    if not reachable_targets:
+        return []
+    candidates = _remote_recovery_candidates(conn)
+    recovered: list[str] = []
+    with write_txn(conn):
+        for target in reachable_targets:
+            for task_id in candidates.get(target, []):
+                if not _parents_satisfied(conn, task_id):
+                    continue
+                resume_status = _resume_status_from_events(conn, task_id)
+                cur = conn.execute(
+                    "UPDATE tasks SET status = ?, consecutive_failures = 0, "
+                    "last_failure_error = NULL "
+                    "WHERE id = ? AND status = 'blocked' AND assignee = ?",
+                    (resume_status, task_id, target),
+                )
+                if cur.rowcount != 1:
+                    continue
+                _append_event(
+                    conn,
+                    task_id,
+                    "peer_recovered",
+                    {"target": target, "status": resume_status},
+                )
+                recovered.append(task_id)
+    return recovered
+
+
 def _set_worker_pid(conn: sqlite3.Connection, task_id: str, pid: int) -> None:
     """Record the spawned child's pid + emit a ``spawned`` event.
 
@@ -9835,6 +9945,13 @@ def dispatch_once(
     boards tick in parallel. See :func:`_dispatch_tick_lock` for the
     cross-process / cross-platform mechanics.
     """
+    # Peer probes perform bounded network I/O and must never extend the
+    # board's single-writer critical section. Revalidate every candidate
+    # under the lock before changing state, so a concurrent manual action
+    # always wins over this optimistic reachability snapshot.
+    reachable_remote_targets = (
+        set() if dry_run else _probe_remote_recovery_targets(conn)
+    )
     try:
         db_path = kanban_db_path(board=board)
     except Exception:
@@ -9854,6 +9971,7 @@ def dispatch_once(
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
             reconcile_orphans=reconcile_orphans,
+            reachable_remote_targets=reachable_remote_targets,
         )
         _fire_dispatch_tick_hook(result, board=board, dry_run=dry_run)
         return result
@@ -9874,6 +9992,7 @@ def dispatch_once(
                 default_assignee=default_assignee,
                 max_in_progress_per_profile=max_in_progress_per_profile,
                 reconcile_orphans=reconcile_orphans,
+                reachable_remote_targets=reachable_remote_targets,
             )
             # Still under the dispatch lock: run the periodic PASSIVE WAL
             # checkpoint (see _maybe_checkpoint_wal; the -wal file size is
@@ -9901,6 +10020,7 @@ def _dispatch_once_locked(
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
     reconcile_orphans: bool = True,
+    reachable_remote_targets: Optional[set[str]] = None,
 ) -> DispatchResult:
     """Run one dispatcher tick.
 
@@ -9969,6 +10089,9 @@ def _dispatch_once_locked(
     if _crash_rate_limited:
         result.rate_limited.extend(_crash_rate_limited)
     result.timed_out = enforce_max_runtime(conn)
+    result.peer_recovered = _recover_remote_peer_tasks(
+        conn, reachable_remote_targets or set(),
+    )
     result.promoted = recompute_ready(conn, failure_limit=failure_limit)
 
     # Count tasks already running so max_spawn enforces concurrency rather

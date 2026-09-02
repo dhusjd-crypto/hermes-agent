@@ -3,6 +3,10 @@
 from __future__ import annotations
 
 import subprocess
+import time
+import urllib.error
+
+import pytest
 
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_remote_worker
@@ -157,3 +161,226 @@ def test_remote_bridge_commits_result_with_run_guard(tmp_path, monkeypatch):
     assert "remote-session-1" in run["metadata"]
     assert seen["target"] == "peer:spark/researcher"
     assert "Return evidence" in seen["context"]
+
+
+def test_remote_bridge_marks_transport_outage_on_active_run(tmp_path, monkeypatch):
+    db_path = _isolate_kanban(tmp_path, monkeypatch)
+    conn = kb.connect(db_path)
+    try:
+        task_id = kb.create_task(
+            conn, title="remote outage", assignee="peer:spark/researcher"
+        )
+        claimed = kb.claim_task(conn, task_id)
+        run_id = claimed.current_run_id
+    finally:
+        conn.close()
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+    monkeypatch.setenv(
+        "HERMES_KANBAN_REMOTE_TARGET", "peer:spark/researcher"
+    )
+
+    def offline(*_args, **_kwargs):
+        raise peer_cmd.PeerUnavailableError("connection refused")
+
+    monkeypatch.setattr(peer_cmd, "execute_kanban_task", offline)
+    assert kanban_remote_worker.run() == 1
+
+    conn = kb.connect(db_path)
+    try:
+        marker = conn.execute(
+            "SELECT run_id, payload FROM task_events "
+            "WHERE task_id=? AND kind='remote_peer_unavailable'",
+            (task_id,),
+        ).fetchone()
+        current = kb.get_task(conn, task_id)
+    finally:
+        conn.close()
+    assert marker is not None
+    assert marker["run_id"] == run_id
+    assert "connection refused" in marker["payload"]
+    assert current.status == "running"
+
+
+def _exhaust_offline_remote_task(conn, task_id: str) -> None:
+    claimed = kb.claim_task(conn, task_id)
+    run_id = claimed.current_run_id
+    assert run_id is not None
+    assert kb.record_remote_peer_unavailable(
+        conn,
+        task_id,
+        error="Peer is unreachable: connection refused",
+        expected_run_id=run_id,
+    )
+    with kb.write_txn(conn):
+        now = int(time.time())
+        conn.execute(
+            "UPDATE task_runs SET status='crashed', outcome='crashed', "
+            "ended_at=? WHERE id=?",
+            (now, run_id),
+        )
+        conn.execute(
+            "UPDATE tasks SET status='ready', claim_lock=NULL, "
+            "claim_expires=NULL, worker_pid=NULL, current_run_id=NULL "
+            "WHERE id=?",
+            (task_id,),
+        )
+        kb._append_event(
+            conn, task_id, "crashed", {"error": "worker exited 1"}, run_id=run_id
+        )
+    assert kb._record_task_failure(
+        conn,
+        task_id,
+        "worker exited 1",
+        outcome="crashed",
+        failure_limit=1,
+    )
+    assert kb.get_task(conn, task_id).status == "blocked"
+
+
+def test_dispatch_revives_and_spawns_exhausted_task_when_peer_recovers(
+    tmp_path, monkeypatch,
+):
+    db_path = _isolate_kanban(tmp_path, monkeypatch)
+    conn = kb.connect(db_path)
+    spawned = []
+    try:
+        task_id = kb.create_task(
+            conn,
+            title="remote recovery",
+            assignee="peer:spark/researcher",
+            max_retries=1,
+        )
+        claimed = kb.claim_task(conn, task_id)
+        run_id = claimed.current_run_id
+        assert run_id is not None
+        assert kb.record_remote_peer_unavailable(
+            conn,
+            task_id,
+            error="Peer is unreachable: connection refused",
+            expected_run_id=run_id,
+        )
+        kb._set_worker_pid(conn, task_id, 8123)
+        monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+        monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
+        monkeypatch.setattr(peer_cmd, "probe_kanban_target", lambda target: True)
+
+        # The first tick observes the dead bridge, exhausts the retry budget,
+        # and blocks. Recovery candidates are intentionally probed before the
+        # dispatch lock, so the newly blocked task is picked up next tick.
+        first = kb.dispatch_once(
+            conn,
+            spawn_fn=lambda *_args, **_kwargs: pytest.fail("must block first"),
+            failure_limit=1,
+        )
+        assert first.peer_recovered == []
+        assert kb.get_task(conn, task_id).status == "blocked"
+
+        result = kb.dispatch_once(
+            conn,
+            spawn_fn=lambda task, workspace, **_kw: spawned.append(task.id) or 8124,
+            failure_limit=1,
+        )
+        current = kb.get_task(conn, task_id)
+        events = kb.list_events(conn, task_id)
+    finally:
+        conn.close()
+
+    assert result.peer_recovered == [task_id]
+    assert spawned == [task_id]
+    assert current.status == "running"
+    assert current.consecutive_failures == 0
+    assert any(event.kind == "peer_recovered" for event in events)
+
+
+def test_dispatch_keeps_exhausted_remote_task_blocked_while_peer_is_offline(
+    tmp_path, monkeypatch,
+):
+    db_path = _isolate_kanban(tmp_path, monkeypatch)
+    conn = kb.connect(db_path)
+    try:
+        task_id = kb.create_task(
+            conn, title="remote offline", assignee="peer:spark/researcher"
+        )
+        _exhaust_offline_remote_task(conn, task_id)
+        monkeypatch.setattr(peer_cmd, "probe_kanban_target", lambda target: False)
+
+        result = kb.dispatch_once(
+            conn,
+            spawn_fn=lambda *_args, **_kwargs: pytest.fail("must not spawn"),
+            failure_limit=1,
+        )
+        current = kb.get_task(conn, task_id)
+    finally:
+        conn.close()
+
+    assert result.peer_recovered == []
+    assert current.status == "blocked"
+
+
+def test_dispatch_does_not_revive_ordinary_remote_failure(
+    tmp_path, monkeypatch,
+):
+    """Only a proven transport outage may bypass the retry-limit block."""
+    db_path = _isolate_kanban(tmp_path, monkeypatch)
+    conn = kb.connect(db_path)
+    try:
+        task_id = kb.create_task(
+            conn, title="remote application failure", assignee="peer:spark/researcher"
+        )
+        claimed = kb.claim_task(conn, task_id)
+        run_id = claimed.current_run_id
+        with kb.write_txn(conn):
+            now = int(time.time())
+            conn.execute(
+                "UPDATE task_runs SET status='crashed', outcome='crashed', "
+                "ended_at=? WHERE id=?",
+                (now, run_id),
+            )
+            conn.execute(
+                "UPDATE tasks SET status='ready', claim_lock=NULL, "
+                "claim_expires=NULL, worker_pid=NULL, current_run_id=NULL "
+                "WHERE id=?",
+                (task_id,),
+            )
+            kb._append_event(
+                conn,
+                task_id,
+                "crashed",
+                {"error": "remote agent failed"},
+                run_id=run_id,
+            )
+        assert kb._record_task_failure(
+            conn,
+            task_id,
+            "remote agent failed",
+            outcome="crashed",
+            failure_limit=1,
+        )
+        monkeypatch.setattr(
+            peer_cmd,
+            "probe_kanban_target",
+            lambda _target: pytest.fail("ordinary failures must not probe the peer"),
+        )
+
+        result = kb.dispatch_once(
+            conn,
+            spawn_fn=lambda *_args, **_kwargs: pytest.fail("must not spawn"),
+            failure_limit=1,
+        )
+        current = kb.get_task(conn, task_id)
+    finally:
+        conn.close()
+
+    assert result.peer_recovered == []
+    assert current.status == "blocked"
+    assert current.consecutive_failures == 1
+
+
+def test_peer_transport_failure_has_explicit_unavailable_type(monkeypatch):
+    def fail_urlopen(*_args, **_kwargs):
+        raise urllib.error.URLError("connection refused")
+
+    monkeypatch.setattr("urllib.request.urlopen", fail_urlopen)
+    with pytest.raises(peer_cmd.PeerUnavailableError):
+        peer_cmd._request("http://peer.invalid/api/status", "key", timeout=1)

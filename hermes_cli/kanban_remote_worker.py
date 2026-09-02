@@ -14,7 +14,7 @@ import sys
 
 def run() -> int:
     from hermes_cli import kanban_db as kb
-    from hermes_cli.subcommands.peer import execute_kanban_task
+    from hermes_cli.subcommands.peer import PeerUnavailableError, execute_kanban_task
 
     task_id = (os.environ.get("HERMES_KANBAN_TASK") or "").strip()
     target = (os.environ.get("HERMES_KANBAN_REMOTE_TARGET") or "").strip()
@@ -39,6 +39,23 @@ def run() -> int:
             task_id=task_id,
             context=context,
         )
+    except PeerUnavailableError as exc:
+        # Persist the transport classification before exiting. The ordinary
+        # crash path still owns retry accounting; this marker only lets a
+        # later dispatcher distinguish peer-offline exhaustion from sticky
+        # worker/application failures.
+        conn = kb.connect()
+        try:
+            kb.record_remote_peer_unavailable(
+                conn,
+                task_id,
+                error=str(exc),
+                expected_run_id=expected_run_id,
+            )
+        finally:
+            conn.close()
+        print(f"remote Kanban peer unavailable: {exc}", file=sys.stderr)
+        return 1
     except Exception as exc:
         # A non-zero child exit is intentionally handled by the dispatcher's
         # existing crash/retry circuit breaker on its next tick.

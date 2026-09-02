@@ -42,6 +42,11 @@ _PROFILE_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$")
 # One synchronous agent turn can legitimately take minutes.
 DM_TIMEOUT_S = 600
 LIST_TIMEOUT_S = 30
+KANBAN_PROBE_TIMEOUT_S = 2
+
+
+class PeerUnavailableError(RuntimeError):
+    """The registered peer could not be reached at the transport layer."""
 
 
 def _peer_key_env(name: str) -> str:
@@ -89,8 +94,14 @@ def _request(url: str, key: str, *, method: str = "GET", body: dict | None = Non
             "User-Agent": "hermes-peer-dm",
         },
     )
-    with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310 — user-registered peer URL
-        payload = resp.read().decode("utf-8", "replace")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310 — user-registered peer URL
+            payload = resp.read().decode("utf-8", "replace")
+    except urllib.error.HTTPError:
+        # An HTTP response proves reachability. Preserve auth/config failures.
+        raise
+    except (urllib.error.URLError, TimeoutError, ConnectionError) as exc:
+        raise PeerUnavailableError(f"Peer is unreachable: {exc}") from exc
     try:
         parsed = json.loads(payload)
     except ValueError as exc:
@@ -166,6 +177,30 @@ def parse_kanban_target(target: str) -> tuple[str, str]:
             "Remote Kanban target requires a profile: peer:<peer>/<profile>"
         )
     return peer, profile
+
+
+def probe_kanban_target(
+    target: str, *, timeout: int = KANBAN_PROBE_TIMEOUT_S,
+) -> bool:
+    """Return whether a remote executor target is reachable and authorized.
+
+    This bounded read uses the same profile-multiplexed sessions route and
+    credential as execution. A host-only health endpoint would not prove that
+    the configured profile and credential still work.
+    """
+    try:
+        peer_name, profile = parse_kanban_target(target)
+        peer = _load_peers().get(peer_name)
+        if not isinstance(peer, dict) or not peer.get("url"):
+            return False
+        key = _peer_secret(peer_name)
+        if not key:
+            return False
+        base = _base_url(peer, profile)
+        _request(f"{base}/api/sessions?limit=1", key, timeout=timeout)
+        return True
+    except Exception:
+        return False
 
 
 def execute_kanban_task(
