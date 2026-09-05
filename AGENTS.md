@@ -1782,3 +1782,8 @@ test('windowsHide defaults to true on Windows, is left alone elsewhere', () => {
 If the logic lives inline in a god-file (`main.ts`, `cli.py`,
 `gateway/run.py`) and extracting it feels disruptive: that's the actual
 signal to do the extraction, not to regex around it.
+## Kalıcı proje merkezi
+
+- Proje bağlamını ve güncel code-independent durumu görmek için docs/PROJECT_HUB.md dosyasını oku.
+- Proje durumu için sohbet, kişisel bağlam veya geçmiş aramasına güvenme; anlamlı değişiklikten sonra hub’daki ilgili durum/kanıt/sıradaki adımı güncelle.
+- Bu hub roadmap’in yerine geçmez ve başka projelerin durumunu içermez.
